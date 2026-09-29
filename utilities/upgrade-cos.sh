@@ -28,7 +28,7 @@ RESERVE_IP=1
 KEEP_OLD=0
 DELETE_FIRST=1
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/lib-bwgc-cloudinit.sh"
 
 usage() {
@@ -106,6 +106,9 @@ command -v gcloud >/dev/null 2>&1 || { echo "gcloud not found. Run this from Clo
 # non-interactive ssh command never sources. The definition is written to the
 # instance once and sourced by each remote command that needs it. Carrying it
 # inline instead means nesting quotes inside quotes at every call site.
+# The tilde is meant to stay literal: this string is sent to the instance
+# inside --command, where the remote login shell expands it.
+# shellcheck disable=SC2088
 COMPOSE_HELPER='~/.bwgc-compose.sh'
 COMPOSE_SRC=". $COMPOSE_HELPER;"
 
@@ -144,21 +147,47 @@ confirm() {
 
 say "Resolving the target milestone"
 if [ -z "$IMAGE_FAMILY" ]; then
-	# Probe family pointers rather than listing images. Individual images get
-	# marked DEPRECATED as newer builds supersede them within a live family, so
-	# an image listing reports healthy milestones as deprecated. The family
-	# endpoint is the truth: it 404s once a milestone reaches end of support.
-	for m in 165 161 157 153 149 145 141 137 133 129 125 121 117; do
-		if gcloud compute images describe-from-family "cos-${m}-lts" \
-			--project cos-cloud --format="value(name)" >/dev/null 2>&1; then
-			IMAGE_FAMILY="cos-${m}-lts"
-			break
-		fi
-	done
-	[ -n "$IMAGE_FAMILY" ] || { echo "could not resolve a live cos-*-lts family" >&2; exit 1; }
-	echo "newest live LTS family: $IMAGE_FAMILY"
+	# The families are listed from Google and each is probed in this zone;
+	# see cos_lts_families. Individual images get marked DEPRECATED as newer
+	# builds supersede them within a live family, so an image listing alone
+	# would report healthy milestones as deprecated; the family endpoint is
+	# the truth, and it 404s once a milestone reaches end of support. The
+	# first run of the end-to-end test showed why the probe must be zonal:
+	# cos-133-lts answered globally, had no image in us-central1-a yet, and
+	# the old instance was deleted before the replacement failed to create.
+	IMAGE_FAMILY=$(cos_lts_families "$ZONE" | head -1)
+	[ -n "$IMAGE_FAMILY" ] || { echo "could not resolve a live cos-*-lts family in $ZONE" >&2; exit 1; }
+	echo "newest live LTS family in $ZONE: $IMAGE_FAMILY"
 fi
 MILESTONE=$(printf '%s' "$IMAGE_FAMILY" | sed 's/^cos-//; s/-lts$//')
+
+# Whether given or resolved, the family must have an image in this zone before
+# anything is stopped: the create in Step 3 asks the zone, not the world.
+#
+# With --zone the command returns an image family view, which wraps the image
+# under "image", so the field is image.name; without --zone it is name. Both
+# are asked for, and the empty one dropped, so this reads the same whichever
+# shape gcloud answers with. The second end-to-end run refused a family the
+# zone had, on value(name) alone coming back empty.
+IMAGE_NAME=$(gcloud compute images describe-from-family "$IMAGE_FAMILY" \
+	--project cos-cloud --zone "$ZONE" --format="value(name,image.name)" 2>/dev/null | tr -d '\t' || true)
+if [ -z "$IMAGE_NAME" ]; then
+	cat >&2 <<EOF
+
+STOPPING: $IMAGE_FAMILY has no image available in $ZONE.
+
+The family exists, but its images reach zones on a rollout schedule and this
+zone does not have one yet, so creating the replacement here would fail after
+the old instance was already gone. Wait a few days and try again, or name a
+family that is already in this zone:
+
+    gcloud compute images describe-from-family cos-<n>-lts --project cos-cloud --zone $ZONE
+
+Nothing has been changed.
+EOF
+	exit 1
+fi
+echo "image in $ZONE: $IMAGE_NAME"
 
 # The boot disk is whatever the image declares it needs. Google has said 10 GB
 # for every COS milestone since 2019.
@@ -168,7 +197,7 @@ MILESTONE=$(printf '%s' "$IMAGE_FAMILY" | sed 's/^cos-//; s/-lts$//')
 # happened; if it does, stop rather than silently start billing.
 DATA_DISK_GB=15
 IMAGE_MIN=$(gcloud compute images describe-from-family "$IMAGE_FAMILY" \
-	--project cos-cloud --format="value(diskSizeGb)" 2>/dev/null || true)
+	--project cos-cloud --zone "$ZONE" --format="value(diskSizeGb,image.diskSizeGb)" 2>/dev/null | tr -d '\t' || true)
 
 if [ -n "$IMAGE_MIN" ]; then
 	if [ "$IMAGE_MIN" -gt "$DATA_DISK_GB" ]; then
@@ -551,7 +580,7 @@ on_vm "$NEW_INSTANCE" "set -e; \
   on_vm "$NEW_INSTANCE" "docker ps --format '{{.Names}}\t{{.Status}}'"
 
 say "Step 6/7: verify"
-DOMAIN=$(on_vm "$NEW_INSTANCE" "grep -E '^DOMAIN=' $MOUNT/bitwarden_gcloud/.env | cut -d= -f2 | tr -d '\"'" 2>/dev/null | tr -d '\r' || true)
+DOMAIN=$(on_vm "$NEW_INSTANCE" "grep -E '^DOMAIN=' $MOUNT/bitwarden_gcloud/.env | tail -1 | cut -d= -f2 | tr -d '\"'" 2>/dev/null | tr -d '\r' || true)
 on_vm "$NEW_INSTANCE" "set +e; \
   echo '--- jails ---'; docker exec fail2ban fail2ban-client status 2>&1 | tail -2; \
   echo '--- update timer ---'; systemctl list-timers cos-update-reboot.timer --no-pager | head -3; \
